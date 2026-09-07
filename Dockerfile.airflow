@@ -1,0 +1,4 @@
+FROM docker.getcollate.io/openmetadata/ingestion:1.13.1
+
+# Dépendances utilisées par les DAGs du projet (dags/scripts/*.py)
+RUN pip install --no-cache-dir --user boto3 python-dotenv pandas

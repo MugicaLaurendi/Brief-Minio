@@ -1,0 +1,282 @@
+volumes:
+  db-data:
+  es-data:
+  ingestion-volume-tmp:
+  minio-data:
+  kes-keys:
+
+networks:
+  app_net:
+    driver: bridge
+
+services:
+
+  # ---------------------------------------------------------------------
+  # MinIO : stockage objet S3 utilisé par les DAGs (raw/staging/curated/archive)
+  # ---------------------------------------------------------------------
+  minio:
+    container_name: minio
+    image: minio/minio:latest
+    command: server /data --console-address ":9001"
+    restart: always
+    depends_on:
+      kes:
+        condition: service_healthy
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ACCESS_KEY:-minioadmin}
+      MINIO_ROOT_PASSWORD: ${MINIO_SECRET_KEY:-minioadmin}
+      MINIO_KMS_KES_ENDPOINT: https://kes:7373
+      MINIO_KMS_KES_CERT_FILE: /certs/minio-client.cert
+      MINIO_KMS_KES_KEY_FILE: /certs/minio-client.key
+      MINIO_KMS_KES_CAPATH: /certs/server.cert
+      MINIO_KMS_KES_KEY_NAME: minio-archivage-key
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    volumes:
+      - ./minio-data:/data
+      - ./kes/certs:/certs:ro
+    networks:
+      - app_net
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  createbuckets:
+    container_name: minio_createbuckets
+    image: minio/mc:latest
+    depends_on:
+      minio:
+        condition: service_healthy
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ACCESS_KEY:-minioadmin}
+      MINIO_ROOT_PASSWORD: ${MINIO_SECRET_KEY:-minioadmin}
+    entrypoint: >
+      /bin/sh -c "
+      mc alias set local http://minio:9000 $$MINIO_ROOT_USER $$MINIO_ROOT_PASSWORD;
+      mc mb -p local/${MINIO_BUCKET_RAW:-raw} local/${MINIO_BUCKET_STAGING:-staging} local/${MINIO_BUCKET_CURATED:-curated} local/${MINIO_BUCKET_ARCHIVE:-archive};
+      mc encrypt set sse-s3 local/${MINIO_BUCKET_RAW:-raw};
+      mc encrypt set sse-s3 local/${MINIO_BUCKET_STAGING:-staging};
+      mc encrypt set sse-s3 local/${MINIO_BUCKET_CURATED:-curated};
+      mc encrypt set sse-s3 local/${MINIO_BUCKET_ARCHIVE:-archive};
+      exit 0;
+      "
+    networks:
+      - app_net
+
+  # ---------------------------------------------------------------------
+  # KES : service de gestion de clés utilisé par MinIO pour le chiffrement
+  # au repos (SSE-S3) des buckets raw/staging/curated/archive.
+  # Note : KES est déprécié côté MinIO (plus maintenu, remplacé par MinKMS
+  # pour AIStor) mais reste fonctionnel pour un usage local/dev.
+  # ---------------------------------------------------------------------
+  kes:
+    container_name: kes
+    image: minio/kes:latest
+    restart: always
+    entrypoint: /kes
+    command: ["server", "--config", "/config.yml", "--addr", "0.0.0.0:7373"]
+    volumes:
+      - ./kes/config.yml:/config.yml:ro
+      - ./kes/certs:/certs:ro
+      - kes-keys:/keys
+    networks:
+      - app_net
+    healthcheck:
+      test: ["CMD", "bash", "-c", "cat < /dev/null > /dev/tcp/127.0.0.1/7373"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  # ---------------------------------------------------------------------
+  # Base MySQL partagée : schema openmetadata_db + schema airflow_db
+  # ---------------------------------------------------------------------
+  mysql:
+    container_name: openmetadata_mysql
+    image: docker.getcollate.io/openmetadata/db:1.13.1
+    command: "--sort_buffer_size=10M"
+    restart: always
+    environment:
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:-password}
+    volumes:
+      - db-data:/var/lib/mysql
+    networks:
+      - app_net
+    healthcheck:
+      test: mysql --user=root --password=$$MYSQL_ROOT_PASSWORD --silent --execute "use openmetadata_db"
+      interval: 15s
+      timeout: 10s
+      retries: 10
+
+  elasticsearch:
+    container_name: openmetadata_elasticsearch
+    image: docker.elastic.co/elasticsearch/elasticsearch:9.3.0
+    environment:
+      - discovery.type=single-node
+      - ES_JAVA_OPTS=-Xms1024m -Xmx1024m
+      - xpack.security.enabled=false
+    volumes:
+      - es-data:/usr/share/elasticsearch/data
+    networks:
+      - app_net
+    healthcheck:
+      test: "curl -s http://localhost:9200/_cluster/health?pretty | grep status | grep -qE 'green|yellow' || exit 1"
+      interval: 15s
+      timeout: 10s
+      retries: 10
+
+  # ---------------------------------------------------------------------
+  # OpenMetadata
+  # ---------------------------------------------------------------------
+  execute-migrate-all:
+    container_name: execute_migrate_all
+    image: docker.getcollate.io/openmetadata/server:1.13.1
+    command: "./bootstrap/openmetadata-ops.sh migrate"
+    environment:
+      DB_DRIVER_CLASS: com.mysql.cj.jdbc.Driver
+      DB_SCHEME: mysql
+      DB_PARAMS: allowPublicKeyRetrieval=true&useSSL=false&serverTimezone=UTC
+      DB_USER: ${DB_USER:-openmetadata_user}
+      DB_USER_PASSWORD: ${DB_USER_PASSWORD:-openmetadata_password}
+      DB_HOST: mysql
+      DB_PORT: 3306
+      OM_DATABASE: ${OM_DATABASE:-openmetadata_db}
+      ELASTICSEARCH_HOST: elasticsearch
+      ELASTICSEARCH_PORT: 9200
+      ELASTICSEARCH_SCHEME: http
+      SEARCH_TYPE: elasticsearch
+    depends_on:
+      mysql:
+        condition: service_healthy
+      elasticsearch:
+        condition: service_healthy
+    networks:
+      - app_net
+
+  openmetadata-server:
+    container_name: openmetadata_server
+    image: docker.getcollate.io/openmetadata/server:1.13.1
+    restart: always
+    environment:
+      OPENMETADATA_CLUSTER_NAME: openmetadata
+      SERVER_PORT: 8585
+      SERVER_ADMIN_PORT: 8586
+      LOG_LEVEL: INFO
+
+      # Auth (basique, pas d'IdP externe)
+      AUTHORIZER_CLASS_NAME: org.openmetadata.service.security.DefaultAuthorizer
+      AUTHORIZER_REQUEST_FILTER: org.openmetadata.service.security.JwtFilter
+      AUTHORIZER_ADMIN_PRINCIPALS: "[admin]"
+      AUTHORIZER_INGESTION_PRINCIPALS: "[ingestion-bot]"
+      AUTHORIZER_PRINCIPAL_DOMAIN: "open-metadata.org"
+      AUTHENTICATION_PROVIDER: basic
+      AUTHENTICATION_PUBLIC_KEYS: "[http://localhost:8585/api/v1/system/config/jwks]"
+      AUTHENTICATION_JWT_PRINCIPAL_CLAIMS: "[email,preferred_username,sub]"
+      AUTHENTICATION_ENABLE_SELF_SIGNUP: "true"
+      RSA_PUBLIC_KEY_FILE_PATH: "./conf/public_key.der"
+      RSA_PRIVATE_KEY_FILE_PATH: "./conf/private_key.der"
+      JWT_ISSUER: "open-metadata.org"
+      JWT_KEY_ID: "Gb389a-9f76-gdjs-a92j-0242bk94356"
+
+      # Connexion à l'ingestion Airflow
+      PIPELINE_SERVICE_CLIENT_ENABLED: "true"
+      PIPELINE_SERVICE_CLIENT_CLASS_NAME: org.openmetadata.service.clients.pipeline.airflow.AirflowRESTClient
+      PIPELINE_SERVICE_CLIENT_ENDPOINT: http://ingestion:8080
+      SERVER_HOST_API_URL: http://openmetadata-server:8585/api
+      PIPELINE_SERVICE_CLIENT_VERIFY_SSL: "no-ssl"
+      PIPELINE_SERVICE_CLIENT_SECRETS_MANAGER_LOADER: "noop"
+      AIRFLOW_USERNAME: ${AIRFLOW_USERNAME:-admin}
+      AIRFLOW_PASSWORD: ${AIRFLOW_PASSWORD:-admin}
+      FERNET_KEY: ${FERNET_KEY:-jJ/9sz0g0OHxsfxOoSfdFdmk3ysNmPRnH3TUAbz3IHA=}
+      SECRET_MANAGER: db
+
+      # Base de données
+      DB_DRIVER_CLASS: com.mysql.cj.jdbc.Driver
+      DB_SCHEME: mysql
+      DB_PARAMS: allowPublicKeyRetrieval=true&useSSL=false&serverTimezone=UTC
+      DB_USER: ${DB_USER:-openmetadata_user}
+      DB_USER_PASSWORD: ${DB_USER_PASSWORD:-openmetadata_password}
+      DB_HOST: mysql
+      DB_PORT: 3306
+      OM_DATABASE: ${OM_DATABASE:-openmetadata_db}
+
+      # Recherche
+      ELASTICSEARCH_HOST: elasticsearch
+      ELASTICSEARCH_PORT: 9200
+      ELASTICSEARCH_SCHEME: http
+      SEARCH_TYPE: elasticsearch
+
+      EVENT_MONITOR: prometheus
+      OPENMETADATA_HEAP_OPTS: -Xmx1G -Xms1G
+    ports:
+      - "8585:8585"
+      - "8586:8586"
+    depends_on:
+      mysql:
+        condition: service_healthy
+      elasticsearch:
+        condition: service_healthy
+      execute-migrate-all:
+        condition: service_completed_successfully
+    networks:
+      - app_net
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://localhost:8586/healthcheck"]
+
+  # ---------------------------------------------------------------------
+  # Airflow (image officielle OpenMetadata "ingestion" + libs du projet)
+  # ---------------------------------------------------------------------
+  ingestion:
+    container_name: openmetadata_ingestion
+    build:
+      context: .
+      dockerfile: Dockerfile.airflow
+    depends_on:
+      mysql:
+        condition: service_healthy
+      elasticsearch:
+        condition: service_started
+      openmetadata-server:
+        condition: service_started
+    environment:
+      AIRFLOW__API__AUTH_BACKENDS: "airflow.api.auth.backend.basic_auth,airflow.api.auth.backend.session"
+      AIRFLOW__CORE__EXECUTOR: LocalExecutor
+      AIRFLOW__OPENMETADATA_AIRFLOW_APIS__DAG_GENERATED_CONFIGS: "/opt/airflow/dag_generated_configs"
+      DB_HOST: mysql
+      DB_PORT: 3306
+      AIRFLOW_DB: ${AIRFLOW_DB:-airflow_db}
+      DB_SCHEME: mysql+mysqldb
+      DB_USER: ${AIRFLOW_DB_USER:-airflow_user}
+      DB_PASSWORD: ${AIRFLOW_DB_PASSWORD:-airflow_pass}
+
+      # Variables utilisées par les DAGs du projet (dags/scripts/*.py)
+      MINIO_ENDPOINT: ${MINIO_ENDPOINT:-http://minio:9000}
+      MINIO_ACCESS_KEY: ${MINIO_ACCESS_KEY:-minioadmin}
+      MINIO_SECRET_KEY: ${MINIO_SECRET_KEY:-minioadmin}
+      MINIO_SECURE: ${MINIO_SECURE:-false}
+      MINIO_REGION: ${MINIO_REGION:-us-east-1}
+      MINIO_BUCKET_RAW: ${MINIO_BUCKET_RAW:-raw}
+      MINIO_BUCKET_STAGING: ${MINIO_BUCKET_STAGING:-staging}
+      MINIO_BUCKET_CURATED: ${MINIO_BUCKET_CURATED:-curated}
+      MINIO_BUCKET_ARCHIVE: ${MINIO_BUCKET_ARCHIVE:-archive}
+
+      # Variables utilisées par dags/scripts/om_lineage.py pour pousser le lineage
+      OPENMETADATA_HOST_PORT: ${OPENMETADATA_HOST_PORT:-http://openmetadata-server:8585/api}
+      OPENMETADATA_JWT_TOKEN: ${OPENMETADATA_JWT_TOKEN}
+    entrypoint: /bin/bash
+    command:
+      - "/opt/airflow/ingestion_dependency.sh"
+    ports:
+      - "8080:8080"
+    networks:
+      - app_net
+    volumes:
+      - ./dags:/opt/airflow/dags
+      - ./dag_generated_configs:/opt/airflow/dag_generated_configs
+      - ./logs:/opt/airflow/logs
+      - ./plugins:/opt/airflow/plugins
+      - ./data:/opt/airflow/data
+      - ./source:/opt/airflow/source
+      - ingestion-volume-tmp:/tmp

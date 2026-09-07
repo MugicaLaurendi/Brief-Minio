@@ -1,0 +1,20 @@
+version: v1
+
+address: 0.0.0.0:7373
+
+admin:
+  # Identity of the client certificate MinIO uses to talk to KES (kes/certs/minio-client.cert).
+  identity: ab633b44027826af99df2ce5e0df2836f522efc45f08105fb073f5e5d37a52d0
+
+tls:
+  key:  /certs/server.key
+  cert: /certs/server.cert
+
+log:
+  error: on
+  audit: off
+
+keystore:
+  # Local filesystem keystore: fine for this local/dev stack, not for production.
+  fs:
+    path: "/keys"
